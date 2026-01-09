@@ -1,0 +1,47 @@
+# Chatterbox TTS API Server
+#
+# Usage:
+#   docker-compose up -d          # Start in background
+#   docker-compose logs -f        # View logs
+#   docker-compose down           # Stop and remove
+#
+# Environment variables:
+#   CHATTERBOX_MODEL: turbo (default) or standard
+#   CHATTERBOX_DEVICE: cuda (default), cpu, or mps
+
+services:
+  chatterbox-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: chatterbox-tts:latest
+    container_name: chatterbox-api
+    ports:
+      - "8000:8000"
+    environment:
+      - CHATTERBOX_MODEL=${CHATTERBOX_MODEL:-turbo}
+      - CHATTERBOX_DEVICE=${CHATTERBOX_DEVICE:-cuda}
+      - HF_TOKEN=${HF_TOKEN:-}
+    volumes:
+      # Persist voice data
+      - ./voices:/app/voices
+      # Cache Hugging Face models
+      - hf-cache:/app/.cache/huggingface
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import requests; requests.get('http://localhost:8000/health').raise_for_status()"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+
+volumes:
+  hf-cache:
+    name: chatterbox-hf-cache

@@ -20,6 +20,9 @@ from .models.voice_encoder import VoiceEncoder
 from .models.t3.modules.cond_enc import T3Cond
 from .models.t3.modules.t3_config import T3Config
 from .models.s3gen.const import S3GEN_SIL
+from .streaming import S3GenStreamer, StreamingMetrics
+from .streaming.metrics import StreamingTimer
+from typing import Generator, Tuple, Optional
 import logging
 logger = logging.getLogger(__name__)
 
@@ -294,3 +297,127 @@ class ChatterboxTurboTTS:
         wav = wav.squeeze(0).detach().cpu().numpy()
         watermarked_wav = self.watermarker.apply_watermark(wav, sample_rate=self.sr)
         return torch.from_numpy(watermarked_wav).unsqueeze(0)
+
+    def generate_stream(
+        self,
+        text: str,
+        audio_prompt_path: Optional[str] = None,
+        exaggeration: float = 0.0,
+        temperature: float = 0.8,
+        top_k: int = 1000,
+        top_p: float = 0.95,
+        repetition_penalty: float = 1.2,
+        chunk_size: int = 50,
+        norm_loudness: bool = True,
+        watermark: bool = False,
+        print_metrics: bool = False,
+    ) -> Generator[Tuple[torch.Tensor, StreamingMetrics], None, None]:
+        """
+        Stream audio generation, yielding chunks as they become available.
+
+        This method generates speech tokens one at a time and buffers them until
+        chunk_size is reached, then yields audio chunks for real-time playback.
+
+        Args:
+            text: Text to synthesize
+            audio_prompt_path: Path to reference voice audio file (6-15 seconds)
+            exaggeration: Emotion exaggeration (not used in Turbo, kept for API compat)
+            temperature: Sampling temperature (default: 0.8)
+            top_k: Top-k sampling parameter (default: 1000)
+            top_p: Top-p (nucleus) sampling parameter (default: 0.95)
+            repetition_penalty: Penalty for repeated tokens (default: 1.2)
+            chunk_size: Number of speech tokens per audio chunk (default: 50, ~2s audio)
+            norm_loudness: Normalize reference audio loudness (default: True)
+            watermark: Apply watermark to each chunk (default: False, may affect quality)
+            print_metrics: Print latency/RTF metrics after each chunk (default: False)
+
+        Yields:
+            Tuple of (audio_chunk, metrics) where:
+            - audio_chunk: torch.Tensor of shape (num_samples,) at 24kHz sample rate
+            - metrics: StreamingMetrics with latency and performance info
+
+        Example:
+            >>> model = ChatterboxTurboTTS.from_pretrained("cuda")
+            >>> for audio, metrics in model.generate_stream("Hello!", chunk_size=50):
+            ...     # Play audio chunk immediately
+            ...     play_audio(audio.numpy(), sample_rate=24000)
+            ...     print(f"RTF: {metrics.real_time_factor:.3f}")
+        """
+        # Prepare conditionals
+        if audio_prompt_path:
+            self.prepare_conditionals(audio_prompt_path, exaggeration=exaggeration, norm_loudness=norm_loudness)
+        else:
+            assert self.conds is not None, "Please `prepare_conditionals` first or specify `audio_prompt_path`"
+
+        # Normalize and tokenize text
+        text = punc_norm(text)
+        text_tokens = self.tokenizer(text, return_tensors="pt", padding=True, truncation=True)
+        text_tokens = text_tokens.input_ids.to(self.device)
+
+        # Initialize streaming components
+        streamer = S3GenStreamer(
+            s3gen=self.s3gen,
+            ref_dict=self.conds.gen,
+            chunk_size=chunk_size,
+            n_cfm_timesteps=2,  # Turbo uses 2 CFM steps
+        )
+        timer = StreamingTimer()
+        timer.start()
+
+        # Stream tokens from T3
+        token_generator = self.t3.inference_stream(
+            t3_cond=self.conds.t3,
+            text_tokens=text_tokens,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            repetition_penalty=repetition_penalty,
+        )
+
+        # Process tokens and yield audio chunks
+        for token in token_generator:
+            # Skip out-of-vocabulary tokens
+            if token >= 6561:
+                continue
+
+            result = streamer.add_token(token)
+            if result is not None:
+                audio_chunk, num_tokens = result
+                metrics = timer.record_chunk(
+                    audio_samples=len(audio_chunk),
+                    tokens=num_tokens,
+                )
+
+                if print_metrics:
+                    print(metrics)
+
+                # Optionally apply watermark (may affect quality)
+                if watermark:
+                    audio_np = audio_chunk.cpu().numpy()
+                    audio_np = self.watermarker.apply_watermark(audio_np, sample_rate=self.sr)
+                    audio_chunk = torch.from_numpy(audio_np)
+
+                yield audio_chunk, metrics
+                timer.start_chunk()
+
+        # Flush remaining tokens
+        result = streamer.flush()
+        if result is not None:
+            audio_chunk, num_tokens = result
+            metrics = timer.record_chunk(
+                audio_samples=len(audio_chunk),
+                tokens=num_tokens,
+            )
+
+            if print_metrics:
+                print(metrics)
+                print(f"Total: {metrics.total_latency_ms:.0f}ms, "
+                      f"First chunk: {metrics.first_chunk_latency_ms:.0f}ms, "
+                      f"Final RTF: {metrics.real_time_factor:.3f}")
+
+            if watermark:
+                audio_np = audio_chunk.cpu().numpy()
+                audio_np = self.watermarker.apply_watermark(audio_np, sample_rate=self.sr)
+                audio_chunk = torch.from_numpy(audio_np)
+
+            yield audio_chunk, metrics
