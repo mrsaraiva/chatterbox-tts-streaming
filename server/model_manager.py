@@ -83,6 +83,9 @@ class ModelManager:
         if self.model_type == "turbo":
             from chatterbox import ChatterboxTurboTTS
             self.model = ChatterboxTurboTTS.from_pretrained(self.device)
+        elif self.model_type == "multilingual":
+            from chatterbox import ChatterboxMultilingualTTS
+            self.model = ChatterboxMultilingualTTS.from_pretrained(self.device)
         else:
             from chatterbox import ChatterboxTTS
             self.model = ChatterboxTTS.from_pretrained(self.device)

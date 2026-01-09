@@ -38,8 +38,9 @@ class ChatterboxClient:
         self,
         text: str,
         voice_id: str = "default",
+        language: Optional[str] = None,
         temperature: float = 0.8,
-        exaggeration: float = 0.0,
+        exaggeration: float = 0.5,
     ) -> np.ndarray:
         """
         Generate speech synchronously.
@@ -47,22 +48,36 @@ class ChatterboxClient:
         Args:
             text: Text to synthesize
             voice_id: Voice ID to use
+            language: Language code for multilingual model (e.g., 'en', 'es', 'fr', 'ja', 'zh')
             temperature: Sampling temperature
             exaggeration: Emotion exaggeration
 
         Returns:
             numpy array of audio samples (float32, 24kHz)
+
+        Example:
+            >>> client = ChatterboxClient()
+            >>> # English
+            >>> audio = client.generate("Hello world!", language="en")
+            >>> # Spanish
+            >>> audio = client.generate("Hola mundo!", language="es")
+            >>> # Japanese
+            >>> audio = client.generate("こんにちは世界!", language="ja")
         """
         import requests
 
+        data = {
+            "text": text,
+            "voice_id": voice_id,
+            "temperature": temperature,
+            "exaggeration": exaggeration,
+        }
+        if language:
+            data["language"] = language
+
         response = requests.post(
             f"{self.base_url}/v1/tts/generate",
-            data={
-                "text": text,
-                "voice_id": voice_id,
-                "temperature": temperature,
-                "exaggeration": exaggeration,
-            },
+            data=data,
         )
         response.raise_for_status()
 
@@ -72,6 +87,13 @@ class ChatterboxClient:
         audio_int16 = np.frombuffer(wav_bytes[44:], dtype=np.int16)
         audio_float = audio_int16.astype(np.float32) / 32767.0
         return audio_float
+
+    def list_languages(self) -> list:
+        """List supported languages (for multilingual model)."""
+        import requests
+        response = requests.get(f"{self.base_url}/v1/languages")
+        response.raise_for_status()
+        return response.json().get("languages", [])
 
     def stream_sync(
         self,

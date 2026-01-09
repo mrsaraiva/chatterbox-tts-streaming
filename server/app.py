@@ -101,21 +101,51 @@ async def health_check():
     }
 
 
+@app.get("/v1/languages")
+async def list_languages():
+    """List supported languages (for multilingual model only)."""
+    if model_manager.model_type != "multilingual":
+        return {"languages": [], "note": "Language selection only available with multilingual model"}
+
+    from chatterbox import SUPPORTED_LANGUAGES
+    return {
+        "languages": [
+            {"code": code, "name": name}
+            for code, name in SUPPORTED_LANGUAGES.items()
+        ]
+    }
+
+
 @app.post("/v1/tts/generate")
 async def generate_speech(
     text: str = Form(..., description="Text to synthesize"),
     voice_id: str = Form("default", description="Voice ID to use"),
+    language: str = Form(None, description="Language code (e.g., 'en', 'es', 'fr') - required for multilingual model"),
     temperature: float = Form(0.8, description="Sampling temperature"),
-    exaggeration: float = Form(0.0, description="Emotion exaggeration (0.0-1.0)"),
+    exaggeration: float = Form(0.5, description="Emotion exaggeration (0.0-1.0)"),
 ) -> Response:
     """
     Generate speech audio (returns complete WAV file).
 
     This is a synchronous endpoint that waits for full generation.
     For real-time streaming, use the WebSocket or SSE endpoints.
+
+    For multilingual model, the `language` parameter is required.
+    Supported languages: ar, da, de, el, en, es, fi, fr, he, hi, it, ja, ko, ms, nl, no, pl, pt, ru, sv, sw, tr, zh
     """
     if model_manager.model is None:
         raise HTTPException(status_code=503, detail="Model not loaded")
+
+    # Validate language for multilingual model
+    if model_manager.model_type == "multilingual":
+        if not language:
+            raise HTTPException(status_code=400, detail="Language parameter required for multilingual model")
+        from chatterbox import SUPPORTED_LANGUAGES
+        if language.lower() not in SUPPORTED_LANGUAGES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported language '{language}'. Supported: {', '.join(SUPPORTED_LANGUAGES.keys())}"
+            )
 
     # Set voice
     try:
@@ -126,14 +156,23 @@ async def generate_speech(
     # Generate audio
     async with model_manager.request_lock:
         loop = asyncio.get_event_loop()
-        audio = await loop.run_in_executor(
-            None,
-            lambda: model_manager.model.generate(
-                text=text,
-                temperature=temperature,
-                exaggeration=exaggeration,
-            )
-        )
+
+        def generate():
+            if model_manager.model_type == "multilingual":
+                return model_manager.model.generate(
+                    text=text,
+                    language_id=language,
+                    temperature=temperature,
+                    exaggeration=exaggeration,
+                )
+            else:
+                return model_manager.model.generate(
+                    text=text,
+                    temperature=temperature,
+                    exaggeration=exaggeration,
+                )
+
+        audio = await loop.run_in_executor(None, generate)
 
     # Convert to WAV
     audio_np = audio.squeeze().cpu().numpy()
