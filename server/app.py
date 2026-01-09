@@ -2,11 +2,9 @@
 
 import asyncio
 import base64
-import io
 import json
 import logging
 import os
-import struct
 import tempfile
 import time
 from contextlib import asynccontextmanager
@@ -19,6 +17,17 @@ from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile, WebSo
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
 
+from .audio import (
+    AudioFormat,
+    AUDIO_FORMAT_INFO,
+    convert_audio_format,
+    audio_to_wav_bytes,
+    get_audio_format_headers,
+    get_format_info_dict,
+    ALLOWED_AUDIO_EXTENSIONS,
+    MIN_AUDIO_FILE_SIZE,
+    MAX_AUDIO_FILE_SIZE,
+)
 from .model_manager import ModelManager, model_manager
 
 logger = logging.getLogger(__name__)
@@ -26,11 +35,13 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Initialize model on startup."""
+    """Initialize model on startup, cleanup on shutdown."""
     model_type = os.getenv("CHATTERBOX_MODEL", "turbo")
     device = os.getenv("CHATTERBOX_DEVICE", None)
     await model_manager.initialize(model_type=model_type, device=device)
     yield
+    # Cleanup on shutdown
+    await model_manager.shutdown()
 
 
 app = FastAPI(
@@ -50,42 +61,6 @@ app.add_middleware(
 )
 
 
-def audio_to_wav_bytes(audio: np.ndarray, sample_rate: int) -> bytes:
-    """Convert numpy audio array to WAV bytes."""
-    # Normalize and convert to int16
-    audio = np.clip(audio, -1.0, 1.0)
-    audio_int16 = (audio * 32767).astype(np.int16)
-
-    # Create WAV header
-    num_samples = len(audio_int16)
-    bytes_per_sample = 2
-    num_channels = 1
-    byte_rate = sample_rate * num_channels * bytes_per_sample
-    block_align = num_channels * bytes_per_sample
-    data_size = num_samples * bytes_per_sample
-
-    buffer = io.BytesIO()
-    # RIFF header
-    buffer.write(b"RIFF")
-    buffer.write(struct.pack("<I", 36 + data_size))
-    buffer.write(b"WAVE")
-    # fmt chunk
-    buffer.write(b"fmt ")
-    buffer.write(struct.pack("<I", 16))  # chunk size
-    buffer.write(struct.pack("<H", 1))   # PCM format
-    buffer.write(struct.pack("<H", num_channels))
-    buffer.write(struct.pack("<I", sample_rate))
-    buffer.write(struct.pack("<I", byte_rate))
-    buffer.write(struct.pack("<H", block_align))
-    buffer.write(struct.pack("<H", 16))  # bits per sample
-    # data chunk
-    buffer.write(b"data")
-    buffer.write(struct.pack("<I", data_size))
-    buffer.write(audio_int16.tobytes())
-
-    return buffer.getvalue()
-
-
 # ============================================================================
 # REST API Endpoints
 # ============================================================================
@@ -98,6 +73,28 @@ async def health_check():
         "model_loaded": model_manager.model is not None,
         "model_type": model_manager.model_type,
         "device": model_manager.device,
+        "voices_count": len(model_manager.voices),
+    }
+
+
+@app.get("/v1/formats")
+async def list_formats():
+    """
+    List all supported audio output formats.
+
+    Returns format metadata including sample rate, encoding,
+    and recommended use cases.
+    """
+    return {
+        "formats": [
+            {
+                "format": fmt.value,
+                **info,
+            }
+            for fmt, info in AUDIO_FORMAT_INFO.items()
+        ],
+        "default": AudioFormat.WAV.value,
+        "native_sample_rate": 24000,
     }
 
 
@@ -123,16 +120,32 @@ async def generate_speech(
     language: str = Form(None, description="Language code (e.g., 'en', 'es', 'fr') - required for multilingual model"),
     temperature: float = Form(0.8, description="Sampling temperature"),
     exaggeration: float = Form(0.5, description="Emotion exaggeration (0.0-1.0)"),
+    output_format: str = Form("wav", description="Output audio format (wav, pcm_24000_16, mulaw_8000, etc.)"),
 ) -> Response:
     """
-    Generate speech audio (returns complete WAV file).
+    Generate speech audio.
 
-    This is a synchronous endpoint that waits for full generation.
-    For real-time streaming, use the WebSocket or SSE endpoints.
+    Supports multiple output formats:
+    - wav: Complete WAV file (default)
+    - pcm_24000_16: Raw 24kHz 16-bit PCM
+    - pcm_24000_f32: Raw 24kHz 32-bit float PCM
+    - pcm_16000_16: 16kHz 16-bit PCM (for speech recognition)
+    - pcm_8000_16: 8kHz 16-bit PCM (for telephony)
+    - mulaw_8000: G.711 mu-law 8kHz (Twilio/Vonage)
+    - alaw_8000: G.711 A-law 8kHz (European telephony)
 
     For multilingual model, the `language` parameter is required.
-    Supported languages: ar, da, de, el, en, es, fi, fr, he, hi, it, ja, ko, ms, nl, no, pl, pt, ru, sv, sw, tr, zh
     """
+    # Validate output format
+    try:
+        audio_format = AudioFormat(output_format.lower())
+    except ValueError:
+        valid_formats = [f.value for f in AudioFormat]
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid output_format '{output_format}'. Valid: {valid_formats}"
+        )
+
     if model_manager.model is None:
         raise HTTPException(status_code=503, detail="Model not loaded")
 
@@ -154,6 +167,8 @@ async def generate_speech(
         raise HTTPException(status_code=404, detail=str(e))
 
     # Generate audio
+    start_time = time.perf_counter()
+
     async with model_manager.request_lock:
         loop = asyncio.get_event_loop()
 
@@ -174,14 +189,35 @@ async def generate_speech(
 
         audio = await loop.run_in_executor(None, generate)
 
-    # Convert to WAV
+    generation_time_ms = (time.perf_counter() - start_time) * 1000
+
+    # Convert to numpy
     audio_np = audio.squeeze().cpu().numpy()
-    wav_bytes = audio_to_wav_bytes(audio_np, model_manager.model.sr)
+    sample_rate = model_manager.model.sr
+    audio_duration_ms = (len(audio_np) / sample_rate) * 1000
+
+    # Convert to requested format
+    if audio_format == AudioFormat.WAV:
+        content = audio_to_wav_bytes(audio_np, sample_rate)
+        filename = "speech.wav"
+    else:
+        content = convert_audio_format(audio_np, sample_rate, audio_format)
+        ext = audio_format.value.replace("_", ".")
+        filename = f"speech.{ext}"
+
+    # Get format info and headers
+    format_info = AUDIO_FORMAT_INFO[audio_format]
+    headers = get_audio_format_headers(
+        audio_format,
+        audio_duration_ms=audio_duration_ms,
+        generation_time_ms=generation_time_ms,
+    )
+    headers["Content-Disposition"] = f"attachment; filename={filename}"
 
     return Response(
-        content=wav_bytes,
-        media_type="audio/wav",
-        headers={"Content-Disposition": "attachment; filename=speech.wav"},
+        content=content,
+        media_type=format_info["media_type"],
+        headers=headers,
     )
 
 
@@ -191,20 +227,49 @@ async def stream_speech_sse(
     voice_id: str = Query("default", description="Voice ID to use"),
     chunk_size: int = Query(50, description="Tokens per chunk (default: 50)"),
     temperature: float = Query(0.8, description="Sampling temperature"),
+    output_format: str = Query("pcm_24000_16", description="Output audio format"),
+    language: str = Query(None, description="Language code for multilingual model"),
 ) -> StreamingResponse:
     """
     Server-Sent Events streaming TTS.
 
     Returns an event stream with base64-encoded audio chunks.
-    Each event contains either audio data or metrics.
 
     Events:
-    - `audio`: Base64-encoded PCM audio (int16, 24kHz, mono)
+    - `format`: Audio format metadata (sent first)
+    - `audio`: Base64-encoded audio chunk with index
     - `metrics`: JSON metrics for the chunk
     - `done`: Generation complete
+    - `error`: Error occurred
+
+    Supported output formats: pcm_24000_16, pcm_16000_16, mulaw_8000, alaw_8000, etc.
+    Note: WAV format is not suitable for streaming; use pcm_24000_16 instead.
     """
+    # Validate output format
+    try:
+        audio_format = AudioFormat(output_format.lower())
+        if audio_format == AudioFormat.WAV:
+            audio_format = AudioFormat.PCM_24000_16  # WAV not suitable for streaming
+    except ValueError:
+        valid_formats = [f.value for f in AudioFormat if f != AudioFormat.WAV]
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid output_format. Valid for streaming: {valid_formats}"
+        )
+
     if model_manager.model is None:
         raise HTTPException(status_code=503, detail="Model not loaded")
+
+    # Validate language for multilingual model
+    if model_manager.model_type == "multilingual":
+        if not language:
+            raise HTTPException(status_code=400, detail="Language parameter required for multilingual model")
+        from chatterbox import SUPPORTED_LANGUAGES
+        if language.lower() not in SUPPORTED_LANGUAGES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported language '{language}'"
+            )
 
     try:
         await model_manager.set_voice(voice_id)
@@ -212,46 +277,66 @@ async def stream_speech_sse(
         raise HTTPException(status_code=404, detail=str(e))
 
     async def generate():
-        async with model_manager.request_lock:
-            loop = asyncio.get_event_loop()
+        try:
+            # Send format info first
+            format_data = json.dumps(get_format_info_dict(audio_format))
+            yield f"event: format\ndata: {format_data}\n\n"
 
-            # Create generator in thread
-            def create_stream():
-                return model_manager.model.generate_stream(
-                    text=text,
-                    chunk_size=chunk_size,
-                    temperature=temperature,
-                )
+            async with model_manager.request_lock:
+                loop = asyncio.get_event_loop()
+                source_sr = model_manager.model.sr
 
-            stream = await loop.run_in_executor(None, create_stream)
+                # Create generator in thread
+                def create_stream():
+                    return model_manager.model.generate_stream(
+                        text=text,
+                        chunk_size=chunk_size,
+                        temperature=temperature,
+                    )
 
-            # Yield chunks
-            def get_next_chunk(gen):
-                try:
-                    return next(gen)
-                except StopIteration:
-                    return None
+                stream = await loop.run_in_executor(None, create_stream)
 
-            while True:
-                result = await loop.run_in_executor(None, get_next_chunk, stream)
-                if result is None:
-                    break
+                # Yield chunks
+                def get_next_chunk(gen):
+                    try:
+                        return next(gen)
+                    except StopIteration:
+                        return None
 
-                audio_chunk, metrics = result
-                audio_np = audio_chunk.cpu().numpy()
+                chunk_index = 0
+                while True:
+                    result = await loop.run_in_executor(None, get_next_chunk, stream)
+                    if result is None:
+                        break
 
-                # Convert to int16 PCM
-                audio_int16 = (np.clip(audio_np, -1.0, 1.0) * 32767).astype(np.int16)
-                audio_b64 = base64.b64encode(audio_int16.tobytes()).decode()
+                    audio_chunk, metrics = result
+                    audio_np = audio_chunk.cpu().numpy()
 
-                # Send audio event
-                yield f"event: audio\ndata: {audio_b64}\n\n"
+                    # Convert to requested format
+                    audio_bytes = convert_audio_format(audio_np, source_sr, audio_format)
+                    audio_b64 = base64.b64encode(audio_bytes).decode()
 
-                # Send metrics event
-                yield f"event: metrics\ndata: {json.dumps(metrics.to_dict())}\n\n"
+                    # Send audio event with index
+                    audio_data = json.dumps({
+                        "chunk": audio_b64,
+                        "index": chunk_index,
+                    })
+                    yield f"event: audio\ndata: {audio_data}\n\n"
 
-        # Send done event
-        yield "event: done\ndata: {}\n\n"
+                    # Send metrics event
+                    yield f"event: metrics\ndata: {json.dumps(metrics.to_dict())}\n\n"
+
+                    chunk_index += 1
+
+            # Send done event with status
+            done_data = json.dumps({"status": "complete", "total_chunks": chunk_index})
+            yield f"event: done\ndata: {done_data}\n\n"
+
+        except Exception as e:
+            # Send error event
+            error_data = json.dumps({"error": str(e)})
+            yield f"event: error\ndata: {error_data}\n\n"
+            logger.error(f"SSE streaming error: {e}")
 
     return StreamingResponse(
         generate(),
@@ -274,16 +359,29 @@ async def websocket_stream(websocket: WebSocket):
     WebSocket streaming TTS.
 
     Protocol:
-    1. Client sends JSON: {"action": "generate", "text": "...", "voice_id": "default", ...}
-    2. Server sends binary audio chunks (PCM int16, 24kHz, mono)
-    3. Server sends JSON metrics after each chunk
-    4. Server sends JSON {"type": "done", ...} when complete
+    1. Client sends JSON: {"action": "generate", "text": "...", "voice_id": "default", "output_format": "pcm_24000_16", ...}
+    2. Server sends JSON: {"type": "format", "data": {sample_rate, bits, encoding, channels}}
+    3. Server sends JSON: {"type": "start", ...}
+    4. Server sends binary audio chunks (in requested format)
+    5. Server sends JSON metrics after each chunk
+    6. Server sends JSON {"type": "done", ...} when complete
 
     Client can also send:
     - {"action": "ping"} - Server responds with {"type": "pong"}
-    - {"action": "stop"} - Cancel current generation
+    - {"action": "stop"} - Cancel current generation, server responds with {"type": "stopped"}
+
+    Supported output_format values:
+    - pcm_24000_16: Raw 24kHz 16-bit PCM (default)
+    - pcm_16000_16: 16kHz 16-bit PCM
+    - pcm_8000_16: 8kHz 16-bit PCM
+    - mulaw_8000: G.711 mu-law 8kHz (telephony)
+    - alaw_8000: G.711 A-law 8kHz (telephony)
     """
     await websocket.accept()
+
+    # Track active generation for cancellation
+    stop_flag = asyncio.Event()
+    is_generating = False
 
     try:
         while True:
@@ -296,8 +394,21 @@ async def websocket_stream(websocket: WebSocket):
                 await websocket.send_json({"type": "pong"})
                 continue
 
+            if action == "stop":
+                if is_generating:
+                    stop_flag.set()
+                    # The generate handler will send "stopped" when it exits
+                else:
+                    await websocket.send_json({"type": "stopped", "message": "No active generation"})
+                continue
+
             if action == "generate":
-                await handle_generate(websocket, message)
+                stop_flag.clear()
+                is_generating = True
+                try:
+                    await handle_generate(websocket, message, stop_flag)
+                finally:
+                    is_generating = False
                 continue
 
             await websocket.send_json({"type": "error", "message": f"Unknown action: {action}"})
@@ -312,12 +423,26 @@ async def websocket_stream(websocket: WebSocket):
             pass
 
 
-async def handle_generate(websocket: WebSocket, message: dict):
+async def handle_generate(websocket: WebSocket, message: dict, stop_flag: asyncio.Event):
     """Handle a generate request over WebSocket."""
     text = message.get("text", "")
     voice_id = message.get("voice_id", "default")
     chunk_size = message.get("chunk_size", 50)
     temperature = message.get("temperature", 0.8)
+    output_format_str = message.get("output_format", "pcm_24000_16")
+
+    # Validate output format
+    try:
+        output_format = AudioFormat(output_format_str.lower())
+        if output_format == AudioFormat.WAV:
+            output_format = AudioFormat.PCM_24000_16  # WAV not suitable for streaming
+    except ValueError:
+        valid_formats = [f.value for f in AudioFormat if f != AudioFormat.WAV]
+        await websocket.send_json({
+            "type": "error",
+            "message": f"Invalid output_format. Valid: {valid_formats}"
+        })
+        return
 
     if not text:
         await websocket.send_json({"type": "error", "message": "No text provided"})
@@ -333,11 +458,23 @@ async def handle_generate(websocket: WebSocket, message: dict):
         await websocket.send_json({"type": "error", "message": str(e)})
         return
 
+    # Send format info first
+    await websocket.send_json({
+        "type": "format",
+        "data": get_format_info_dict(output_format)
+    })
+
     # Send start message
-    await websocket.send_json({"type": "start", "text": text, "voice_id": voice_id})
+    await websocket.send_json({
+        "type": "start",
+        "text": text,
+        "voice_id": voice_id,
+        "output_format": output_format.value,
+    })
 
     async with model_manager.request_lock:
         loop = asyncio.get_event_loop()
+        source_sr = model_manager.model.sr
 
         def create_stream():
             return model_manager.model.generate_stream(
@@ -359,6 +496,15 @@ async def handle_generate(websocket: WebSocket, message: dict):
         start_time = time.perf_counter()
 
         while True:
+            # Check for stop signal
+            if stop_flag.is_set():
+                await websocket.send_json({
+                    "type": "stopped",
+                    "chunks_generated": chunk_count,
+                    "samples_generated": total_samples,
+                })
+                return
+
             result = await loop.run_in_executor(None, get_next_chunk, stream)
             if result is None:
                 break
@@ -368,9 +514,9 @@ async def handle_generate(websocket: WebSocket, message: dict):
             chunk_count += 1
             total_samples += len(audio_np)
 
-            # Convert to int16 PCM and send as binary
-            audio_int16 = (np.clip(audio_np, -1.0, 1.0) * 32767).astype(np.int16)
-            await websocket.send_bytes(audio_int16.tobytes())
+            # Convert to requested format
+            audio_bytes = convert_audio_format(audio_np, source_sr, output_format)
+            await websocket.send_bytes(audio_bytes)
 
             # Send metrics as JSON
             await websocket.send_json({
@@ -381,7 +527,7 @@ async def handle_generate(websocket: WebSocket, message: dict):
 
     # Send completion message
     total_time = (time.perf_counter() - start_time) * 1000
-    audio_duration = (total_samples / model_manager.model.sr) * 1000
+    audio_duration = (total_samples / source_sr) * 1000
 
     await websocket.send_json({
         "type": "done",
@@ -407,6 +553,8 @@ async def list_voices():
                 "id": voice_id,
                 "name": config.name,
                 "created_at": config.created_at,
+                "language": config.language,
+                "is_default": config.is_default,
             }
             for voice_id, config in voices.items()
         ]
@@ -417,19 +565,36 @@ async def list_voices():
 async def create_voice(
     voice_id: str = Form(..., description="Unique voice identifier"),
     name: str = Form(None, description="Display name for the voice"),
+    language: str = Form("en", description="Language code (e.g., 'en', 'es', 'fr')"),
     audio_file: UploadFile = File(..., description="Reference audio (6-15 seconds)"),
 ):
     """
     Create a new voice from reference audio.
 
-    The audio file should be 6-15 seconds of clear speech from the target voice.
+    The audio file should be 6-15 seconds of clear speech.
+    Supported formats: WAV, MP3, FLAC, OGG (max 50MB).
     """
     if voice_id in model_manager.voices:
         raise HTTPException(status_code=409, detail=f"Voice already exists: {voice_id}")
 
+    # Validate file type
+    filename = audio_file.filename or ""
+    ext = Path(filename).suffix.lower()
+    if ext not in ALLOWED_AUDIO_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported file type '{ext}'. Allowed: {', '.join(ALLOWED_AUDIO_EXTENSIONS)}"
+        )
+
+    # Read and validate file size
+    content = await audio_file.read()
+    if len(content) < MIN_AUDIO_FILE_SIZE:
+        raise HTTPException(status_code=400, detail=f"File too small (minimum {MIN_AUDIO_FILE_SIZE} bytes)")
+    if len(content) > MAX_AUDIO_FILE_SIZE:
+        raise HTTPException(status_code=400, detail=f"File too large (maximum {MAX_AUDIO_FILE_SIZE // (1024*1024)}MB)")
+
     # Save uploaded file temporarily
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
-        content = await audio_file.read()
+    with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
         tmp.write(content)
         tmp_path = tmp.name
 
@@ -438,12 +603,16 @@ async def create_voice(
             voice_id=voice_id,
             audio_path=tmp_path,
             name=name,
+            language=language,
         )
         return {
             "id": voice_id,
             "name": config.name,
+            "language": config.language,
             "message": "Voice created successfully",
         }
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     finally:
         # Clean up temp file
         Path(tmp_path).unlink(missing_ok=True)
@@ -459,6 +628,24 @@ async def delete_voice(voice_id: str):
         return {"message": f"Voice deleted: {voice_id}"}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/v1/voices/{voice_id}/set")
+async def set_current_voice(voice_id: str):
+    """
+    Set the current active voice.
+
+    This voice will be used for subsequent TTS requests
+    if no voice_id is specified.
+    """
+    try:
+        await model_manager.set_voice(voice_id)
+        return {
+            "message": f"Current voice set to: {voice_id}",
+            "voice_id": voice_id,
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
 
 
 # ============================================================================
